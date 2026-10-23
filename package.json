@@ -1,0 +1,8 @@
+{
+  "name": "voice-relay",
+  "version": "1.0.0",
+  "description": "Tiny WebSocket relay for push-to-talk voice rooms (no dependencies)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=16" }
+}

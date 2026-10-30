@@ -1,85 +1,178 @@
-// Minimal voice relay: no dependencies.
-// Client connects to ws(s)://HOST/?room=CODE  and every binary message it sends
-// is forwarded to the other clients in the same room.
+// Voice relay server - no external libraries.
+// - GET /                  -> "voice relay ok" (also used by the app to wake the server)
+// - WebSocket /?room=X&name=Y&v=2
+//     v=2 clients get:   [0x01][senderId][audio...]   and   [0x02][count]{[id][len][name]}...
+//     older clients get: the raw audio bytes, nothing else.
 const http = require('http');
 const crypto = require('crypto');
 
-const PORT = process.env.PORT || 8080;
-const MAX_FRAME = 64 * 1024;       // reject frames larger than this
-const MAX_PER_ROOM = 16;
-const rooms = new Map();           // room -> Set<socket>
+const PORT = process.env.PORT || 3000;
+const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const MAX_ROOM_USERS = 16;
+const MAX_PAYLOAD = 4096;       // audio frames are ~320 bytes
+const MAX_BACKLOG = 64 * 1024;  // skip audio for clients that cannot keep up
+const rooms = new Map();        // room -> Map(id -> client)
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('voice relay ok\n');
+  res.end('voice relay ok');
 });
 
+function cleanName(raw) {
+  let n = String(raw || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  n = Array.from(n).slice(0, 16).join('');
+  return n || 'Player';
+}
+
+function frame(opcode, payload) {
+  const len = payload.length;
+  let head;
+  if (len < 126) {
+    head = Buffer.from([0x80 | opcode, len]);
+  } else {
+    head = Buffer.from([0x80 | opcode, 126, len >> 8, len & 255]);
+  }
+  return Buffer.concat([head, payload]);
+}
+
+function send(client, opcode, payload) {
+  const s = client.socket;
+  if (s.destroyed || !s.writable) return;
+  if (opcode === 2 && s.writableLength > MAX_BACKLOG) return; // drop audio, never queue it forever
+  s.write(frame(opcode, payload));
+}
+
+function broadcastRoster(room) {
+  const members = rooms.get(room);
+  if (!members) return;
+  const parts = [Buffer.from([2, members.size])];
+  for (const [id, c] of members) {
+    const nb = Buffer.from(c.name, 'utf8');
+    parts.push(Buffer.from([id, nb.length]), nb);
+  }
+  const msg = Buffer.concat(parts);
+  for (const c of members.values()) if (c.v2) send(c, 2, msg);
+}
+
+function removeClient(client) {
+  if (client.removed) return;
+  client.removed = true;
+  const members = rooms.get(client.room);
+  if (members) {
+    members.delete(client.id);
+    if (members.size === 0) rooms.delete(client.room);
+    else broadcastRoster(client.room);
+  }
+  client.socket.destroy();
+}
+
+function handleMessage(client, opcode, payload) {
+  client.alive = true;
+  if (opcode === 2) { // audio
+    if (payload.length === 0 || payload.length > MAX_PAYLOAD) return;
+    const members = rooms.get(client.room);
+    if (!members) return;
+    const wrapped = Buffer.concat([Buffer.from([1, client.id]), payload]);
+    for (const c of members.values()) {
+      if (c === client) continue;
+      send(c, 2, c.v2 ? wrapped : payload);
+    }
+  } else if (opcode === 9) { // ping
+    send(client, 10, payload);
+  } else if (opcode === 8) { // close
+    send(client, 8, Buffer.alloc(0));
+    removeClient(client);
+  }
+  // text frames and pongs only count as "alive"
+}
+
+function attachParser(client) {
+  let buf = Buffer.alloc(0);
+  client.socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    while (buf.length >= 2) {
+      const b0 = buf[0], b1 = buf[1];
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        removeClient(client); // far too big for this service
+        return;
+      }
+      if (len > MAX_PAYLOAD) { removeClient(client); return; }
+      const need = off + (masked ? 4 : 0) + len;
+      if (buf.length < need) return;
+      let payload = buf.slice(off + (masked ? 4 : 0), need);
+      if (masked) {
+        const mask = buf.slice(off, off + 4);
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      }
+      buf = buf.slice(need);
+      handleMessage(client, opcode, payload);
+      if (client.removed) return;
+    }
+  });
+}
+
 server.on('upgrade', (req, socket) => {
-  const url = new URL(req.url, 'http://x');
-  const room = (url.searchParams.get('room') || '').slice(0, 32);
   const key = req.headers['sec-websocket-key'];
-  if (!room || !key) { socket.destroy(); return; }
-
-  const set = rooms.get(room) || new Set();
-  if (set.size >= MAX_PER_ROOM) { socket.destroy(); return; }
-
-  const accept = crypto.createHash('sha1')
-    .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch (e) {
+    socket.destroy();
+    return;
+  }
+  const room = (url.searchParams.get('room') || '').slice(0, 64);
+  if (!key || !room) {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    return;
+  }
+  let members = rooms.get(room);
+  if (members && members.size >= MAX_ROOM_USERS) {
+    socket.end('HTTP/1.1 503 Room Full\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
     'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
   socket.setNoDelay(true);
 
-  set.add(socket);
-  rooms.set(room, set);
-  let buf = Buffer.alloc(0);
-
-  const cleanup = () => {
-    set.delete(socket);
-    if (set.size === 0) rooms.delete(room);
+  if (!members) {
+    members = new Map();
+    rooms.set(room, members);
+  }
+  let id = 1;
+  while (members.has(id)) id++;
+  const client = {
+    socket, room, id,
+    name: cleanName(url.searchParams.get('name')),
+    v2: url.searchParams.get('v') === '2',
+    alive: true, removed: false,
   };
-  socket.on('close', cleanup);
-  socket.on('error', () => { cleanup(); socket.destroy(); });
-
-  socket.on('data', (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    while (true) {
-      if (buf.length < 2) return;
-      const opcode = buf[0] & 0x0f;
-      const masked = (buf[1] & 0x80) !== 0;
-      let len = buf[1] & 0x7f;
-      let off = 2;
-      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
-      if (len > MAX_FRAME) { socket.destroy(); return; }
-      const need = off + (masked ? 4 : 0) + len;
-      if (buf.length < need) return;
-      let payload = buf.subarray(off + (masked ? 4 : 0), need);
-      if (masked) {
-        const mask = buf.subarray(off, off + 4);
-        const out = Buffer.alloc(len);
-        for (let i = 0; i < len; i++) out[i] = payload[i] ^ mask[i & 3];
-        payload = out;
-      }
-      buf = buf.subarray(need);
-
-      if (opcode === 0x8) { socket.end(); return; }                 // close
-      if (opcode === 0x9) { socket.write(frame(0xA, payload)); continue; } // ping -> pong
-      if (opcode === 0x2) {                                          // binary audio
-        const f = frame(0x2, payload);
-        for (const peer of set) if (peer !== socket && !peer.destroyed) peer.write(f);
-      }
-    }
-  });
+  members.set(id, client);
+  socket.on('close', () => removeClient(client));
+  socket.on('error', () => removeClient(client));
+  attachParser(client);
+  broadcastRoster(room);
 });
 
-function frame(opcode, payload) {
-  const len = payload.length;
-  let head;
-  if (len < 126) head = Buffer.from([0x80 | opcode, len]);
-  else if (len < 65536) { head = Buffer.alloc(4); head[0] = 0x80 | opcode; head[1] = 126; head.writeUInt16BE(len, 2); }
-  else { head = Buffer.alloc(10); head[0] = 0x80 | opcode; head[1] = 127; head.writeBigUInt64BE(BigInt(len), 2); }
-  return Buffer.concat([head, payload]);
-}
+// Drop connections that went silent (phone lost signal, app killed...).
+setInterval(() => {
+  for (const members of rooms.values()) {
+    for (const c of Array.from(members.values())) {
+      if (!c.alive) { removeClient(c); continue; }
+      c.alive = false;
+      send(c, 9, Buffer.alloc(0));
+    }
+  }
+}, 25000);
 
 server.listen(PORT, () => console.log('voice relay listening on ' + PORT));

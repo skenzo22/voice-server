@@ -1,6 +1,9 @@
 // Voice relay server - no external libraries.
 // - GET /                  -> "voice relay ok" (also used by the app to wake the server)
 // - WebSocket /?room=X&name=Y&v=2
+//     v=3 clients get:   [0x01][senderId][audio...]   and   [0x03][count]{[id][flags][len][name]}...
+//                        flags: bit0 = that person closed his mic, bit1 = this entry is you
+//                        and may send the text frame "m1" / "m0" to tell the room his mic is closed / open
 //     v=2 clients get:   [0x01][senderId][audio...]   and   [0x02][count]{[id][len][name]}...
 //     older clients get: the raw audio bytes, nothing else.
 const http = require('http');
@@ -45,13 +48,27 @@ function send(client, opcode, payload) {
 function broadcastRoster(room) {
   const members = rooms.get(room);
   if (!members) return;
-  const parts = [Buffer.from([2, members.size])];
+  // v2 list (id, name)
+  const parts2 = [Buffer.from([2, members.size])];
   for (const [id, c] of members) {
     const nb = Buffer.from(c.name, 'utf8');
-    parts.push(Buffer.from([id, nb.length]), nb);
+    parts2.push(Buffer.from([id, nb.length]), nb);
   }
-  const msg = Buffer.concat(parts);
-  for (const c of members.values()) if (c.v2) send(c, 2, msg);
+  const msg2 = Buffer.concat(parts2);
+  for (const c of members.values()) {
+    if (c.ver === 2) {
+      send(c, 2, msg2);
+    } else if (c.ver >= 3) {
+      // v3 list: every person gets his own copy, with "this is you" marked
+      const parts3 = [Buffer.from([3, members.size])];
+      for (const [id, m] of members) {
+        const nb = Buffer.from(m.name, 'utf8');
+        const flags = (m.micMuted ? 1 : 0) | (m === c ? 2 : 0);
+        parts3.push(Buffer.from([id, flags, nb.length]), nb);
+      }
+      send(c, 2, Buffer.concat(parts3));
+    }
+  }
 }
 
 function removeClient(client) {
@@ -75,7 +92,16 @@ function handleMessage(client, opcode, payload) {
     const wrapped = Buffer.concat([Buffer.from([1, client.id]), payload]);
     for (const c of members.values()) {
       if (c === client) continue;
-      send(c, 2, c.v2 ? wrapped : payload);
+      send(c, 2, c.ver >= 2 ? wrapped : payload);
+    }
+  } else if (opcode === 1) { // text: "m1" = my mic is closed, "m0" = my mic is open
+    const t = payload.toString('utf8');
+    if (t === 'm1' || t === 'm0') {
+      const closed = t === 'm1';
+      if (client.micMuted !== closed) {
+        client.micMuted = closed;
+        broadcastRoster(client.room);
+      }
     }
   } else if (opcode === 9) { // ping
     send(client, 10, payload);
@@ -154,7 +180,8 @@ server.on('upgrade', (req, socket) => {
   const client = {
     socket, room, id,
     name: cleanName(url.searchParams.get('name')),
-    v2: url.searchParams.get('v') === '2',
+    ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
+    micMuted: false,
     alive: true, removed: false,
   };
   members.set(id, client);

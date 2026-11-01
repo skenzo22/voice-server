@@ -4,6 +4,7 @@
 //     v=3 clients get:   [0x01][senderId][audio...]   and   [0x03][count]{[id][flags][len][name]}...
 //                        flags: bit0 = that person closed his mic, bit1 = this entry is you
 //                        and may send the text frame "m1" / "m0" to tell the room his mic is closed / open
+//                        and "b<id>" / "u<id>" to stop / allow sending his voice to the person with that id
 //     v=2 clients get:   [0x01][senderId][audio...]   and   [0x02][count]{[id][len][name]}...
 //     older clients get: the raw audio bytes, nothing else.
 const http = require('http');
@@ -77,6 +78,7 @@ function removeClient(client) {
   const members = rooms.get(client.room);
   if (members) {
     members.delete(client.id);
+    for (const m of members.values()) m.blocked.delete(client.id);
     if (members.size === 0) rooms.delete(client.room);
     else broadcastRoster(client.room);
   }
@@ -92,11 +94,19 @@ function handleMessage(client, opcode, payload) {
     const wrapped = Buffer.concat([Buffer.from([1, client.id]), payload]);
     for (const c of members.values()) {
       if (c === client) continue;
+      if (client.blocked.size && client.blocked.has(c.id)) continue; // he asked not to be heard by this person
       send(c, 2, c.ver >= 2 ? wrapped : payload);
     }
   } else if (opcode === 1) { // text: "m1" = my mic is closed, "m0" = my mic is open
     const t = payload.toString('utf8');
-    if (t === 'm1' || t === 'm0') {
+    if ((t[0] === 'b' || t[0] === 'u') && /^\d{1,3}$/.test(t.slice(1))) {
+      const rid = parseInt(t.slice(1), 10);
+      if (t[0] === 'b') {
+        if (client.blocked.size < 64) client.blocked.add(rid);
+      } else {
+        client.blocked.delete(rid);
+      }
+    } else if (t === 'm1' || t === 'm0') {
       const closed = t === 'm1';
       if (client.micMuted !== closed) {
         client.micMuted = closed;
@@ -182,6 +192,7 @@ server.on('upgrade', (req, socket) => {
     name: cleanName(url.searchParams.get('name')),
     ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
     micMuted: false,
+    blocked: new Set(),
     alive: true, removed: false,
   };
   members.set(id, client);

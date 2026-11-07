@@ -15,6 +15,10 @@ const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_ROOM_USERS = 16;
 const MAX_PAYLOAD = 4096;       // audio frames are ~320 bytes
 const MAX_BACKLOG = 64 * 1024;  // skip audio for clients that cannot keep up
+const MAX_CLIENTS = 400;        // whole server
+const MAX_FRAMES_PER_SEC = 150; // a normal speaker sends 50; more than this is abuse and is dropped
+let totalClients = 0;
+const byCid = new Map();       // client id -> connection (one live connection per phone)
 const rooms = new Map();        // room -> Map(id -> client)
 
 const server = http.createServer((req, res) => {
@@ -37,6 +41,13 @@ function frame(opcode, payload) {
     head = Buffer.from([0x80 | opcode, 126, len >> 8, len & 255]);
   }
   return Buffer.concat([head, payload]);
+}
+
+function writeFrame(client, buf, droppable) {
+  const s = client.socket;
+  if (s.destroyed || !s.writable) return;
+  if (droppable && s.writableLength > MAX_BACKLOG) return; // drop audio, never queue it forever
+  s.write(buf);
 }
 
 function send(client, opcode, payload) {
@@ -75,6 +86,8 @@ function broadcastRoster(room) {
 function removeClient(client) {
   if (client.removed) return;
   client.removed = true;
+  totalClients--;
+  if (client.cid && byCid.get(client.cid) === client) byCid.delete(client.cid);
   const members = rooms.get(client.room);
   if (members) {
     members.delete(client.id);
@@ -91,11 +104,22 @@ function handleMessage(client, opcode, payload) {
     if (payload.length === 0 || payload.length > MAX_PAYLOAD) return;
     const members = rooms.get(client.room);
     if (!members) return;
-    const wrapped = Buffer.concat([Buffer.from([1, client.id]), payload]);
+    // a speaker cannot send more than a normal number of frames per second
+    const now = Date.now();
+    if (now - client.winStart >= 1000) { client.winStart = now; client.winFrames = 0; }
+    if (++client.winFrames > MAX_FRAMES_PER_SEC) return;
+    // build each kind of frame ONCE and give the same bytes to every listener
+    let frameV2 = null, frameRaw = null;
     for (const c of members.values()) {
       if (c === client) continue;
       if (client.blocked.size && client.blocked.has(c.id)) continue; // he asked not to be heard by this person
-      send(c, 2, c.ver >= 2 ? wrapped : payload);
+      if (c.ver >= 2) {
+        if (!frameV2) frameV2 = frame(2, Buffer.concat([Buffer.from([1, client.id]), payload]));
+        writeFrame(c, frameV2, true);
+      } else {
+        if (!frameRaw) frameRaw = frame(2, payload);
+        writeFrame(c, frameRaw, true);
+      }
     }
   } else if (opcode === 1) { // text: "m1" = my mic is closed, "m0" = my mic is open
     const t = payload.toString('utf8');
@@ -170,11 +194,19 @@ server.on('upgrade', (req, socket) => {
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
     return;
   }
+  if (totalClients >= MAX_CLIENTS) {
+    socket.end('HTTP/1.1 503 Server Full\r\n\r\n');
+    return;
+  }
   let members = rooms.get(room);
   if (members && members.size >= MAX_ROOM_USERS) {
     socket.end('HTTP/1.1 503 Room Full\r\n\r\n');
     return;
   }
+  // the same phone connecting again (toggle, network change, app restart): drop its older connection first
+  const cid = (url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
+  if (cid.length >= 8 && byCid.has(cid)) removeClient(byCid.get(cid));
+  members = rooms.get(room);
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
@@ -191,11 +223,15 @@ server.on('upgrade', (req, socket) => {
     socket, room, id,
     name: cleanName(url.searchParams.get('name')),
     ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
+    cid: cid.length >= 8 ? cid : '',
     micMuted: false,
     blocked: new Set(),
+    winStart: 0, winFrames: 0,
     alive: true, removed: false,
   };
   members.set(id, client);
+  totalClients++;
+  if (client.cid) byCid.set(client.cid, client);
   socket.on('close', () => removeClient(client));
   socket.on('error', () => removeClient(client));
   attachParser(client);

@@ -1,5 +1,6 @@
 // Voice relay server - no external libraries.
 // - GET /                  -> "voice relay ok" (also used by the app to wake the server)
+// - GET /admin             -> admin panel (needs the ADMIN_PASSWORD environment variable on Render)
 // - WebSocket /?room=X&name=Y&v=2
 //     v=3 clients get:   [0x01][senderId][audio...]   and   [0x03][count]{[id][flags][len][name]}...
 //                        flags: bit0 = that person closed his mic, bit1 = this entry is you
@@ -17,11 +18,339 @@ const MAX_PAYLOAD = 4096;       // audio frames are ~320 bytes
 const MAX_BACKLOG = 64 * 1024;  // skip audio for clients that cannot keep up
 const MAX_CLIENTS = 400;        // whole server
 const MAX_FRAMES_PER_SEC = 150; // a normal speaker sends 50; more than this is abuse and is dropped
+const BAN_MS = 10 * 60 * 1000;  // a person removed by the admin cannot come back for 10 minutes
 let totalClients = 0;
 const byCid = new Map();       // client id -> connection (one live connection per phone)
 const rooms = new Map();        // room -> Map(id -> client)
+const bans = new Map();         // "c:<cid>" or "i:<ip>" -> time when the ban ends
+
+// ---------------------------------------------------------------- admin panel
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+const adminHash = ADMIN_PASSWORD ? sha(ADMIN_PASSWORD) : null;
+const failedLogins = new Map(); // ip -> { n, first }
+const MAX_FAILS = 10;
+const FAIL_WINDOW = 10 * 60 * 1000;
+
+function clientIp(req) {
+  const x = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return x || req.socket.remoteAddress || '';
+}
+
+function reply(res, code, type, body, extra) {
+  res.writeHead(code, Object.assign({ 'Content-Type': type, 'Cache-Control': 'no-store' }, extra || {}));
+  res.end(body);
+}
+
+// returns true when the request carries the right password; otherwise it answers the request itself
+function adminAuthed(req, res) {
+  if (!adminHash) { reply(res, 404, 'text/plain', 'Not found'); return false; }
+  const ip = clientIp(req);
+  const now = Date.now();
+  let f = failedLogins.get(ip);
+  if (f && now - f.first > FAIL_WINDOW) { failedLogins.delete(ip); f = null; }
+  if (f && f.n >= MAX_FAILS) { reply(res, 429, 'application/json', '{"error":"too many attempts"}'); return false; }
+  const given = sha(req.headers['x-admin-key'] || '');
+  if (!crypto.timingSafeEqual(given, adminHash)) {
+    if (failedLogins.size > 5000) failedLogins.clear();
+    if (!f) { f = { n: 0, first: now }; failedLogins.set(ip, f); }
+    f.n++;
+    reply(res, 401, 'application/json', '{"error":"unauthorized"}');
+    return false;
+  }
+  failedLogins.delete(ip);
+  return true;
+}
+
+function roomsSnapshot() {
+  const now = Date.now();
+  const list = [];
+  for (const [room, members] of rooms) {
+    list.push({
+      room,
+      count: members.size,
+      members: Array.from(members.values()).map((c) => ({
+        id: c.id, name: c.name, ver: c.ver,
+        muted: !!c.micMuted,
+        speaking: now - c.lastAudio < 500,
+      })),
+    });
+  }
+  list.sort((a, b) => b.count - a.count || (a.room < b.room ? -1 : 1));
+  return { total: totalClients, rooms: list };
+}
+
+function kickClient(room, id) {
+  const members = rooms.get(room);
+  const c = members && members.get(id);
+  if (!c) return false;
+  bans.set(c.cid ? 'c:' + c.cid : 'i:' + c.ip, Date.now() + BAN_MS);
+  send(c, 8, Buffer.alloc(0));
+  removeClient(c);
+  return true;
+}
+
+const ADMIN_HTML = String.raw`<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>لوحة التحكم - الدردشة الصوتية</title>
+<style>
+:root{--bg:#0a0a0a;--card:#151515;--line:#2a2a2a;--red:#e0242b;--text:#f2f2f2;--dim:#9a9a9a;--ok:#2fbf71}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;padding:16px 16px 110px}
+h1{font-size:20px;margin:0}
+header{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap}
+.stat{color:var(--dim);font-size:14px}
+button{font:inherit;color:var(--text);background:#1f1f1f;border:1px solid var(--line);border-radius:10px;padding:8px 14px;cursor:pointer}
+button.red{background:var(--red);border-color:var(--red);font-weight:600}
+button:disabled{opacity:.5}
+input[type=password]{font:inherit;color:var(--text);background:#101010;border:1px solid var(--line);border-radius:10px;padding:10px 12px;width:100%}
+#login{max-width:320px;margin:20vh auto 0;display:flex;flex-direction:column;gap:10px}
+#err{color:var(--red);min-height:1.2em;font-size:14px}
+#app{display:none}
+#rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.room{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.room.me{border-color:var(--red)}
+.room h2{font-size:16px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.room h2 span{color:var(--dim);font-weight:400;font-size:13px}
+.p{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line);font-size:14px}
+.p .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:10px;height:10px;border-radius:50%;background:#444;flex:none}
+.dot.talk{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.m{color:var(--dim);font-size:12px}
+.k{padding:3px 8px;font-size:12px;color:var(--red)}
+.empty{color:var(--dim);text-align:center;padding:40px 0}
+details{margin-bottom:14px;color:var(--dim);font-size:13px}
+details label{margin-inline-end:14px}
+select{font:inherit;background:#101010;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:3px 6px}
+#bar{display:none;position:fixed;inset-inline:0;bottom:0;background:#111;border-top:1px solid var(--red);padding:12px 16px;align-items:center;gap:12px;justify-content:space-between}
+#bar .t{font-size:14px}
+#talk{min-width:150px;padding:14px 18px;touch-action:none;user-select:none;-webkit-user-select:none}
+#talk.on{background:var(--ok);border-color:var(--ok);color:#000}
+#msg{color:var(--dim);font-size:13px;margin-bottom:10px;min-height:1.2em}
+</style>
+</head>
+<body>
+<div id="login">
+  <h1>لوحة التحكم</h1>
+  <input id="pw" type="password" placeholder="كلمة السر" autocomplete="current-password">
+  <button class="red" id="go">دخول</button>
+  <div id="err"></div>
+</div>
+<div id="app">
+  <header>
+    <h1>الغرف المفتوحة</h1>
+    <div><span class="stat" id="stat"></span> <button id="out">خروج</button></div>
+  </header>
+  <details>
+    <summary>إعدادات الصوت</summary>
+    <p>
+      <label>معدل العينات <select id="rate"><option value="8000">8000</option><option value="16000">16000</option></select></label>
+      <label><input type="checkbox" id="be"> عكس ترتيب البايت</label>
+    </p>
+    <p>إن سمعت ضجيجاً بدل الصوت جرّب عكس ترتيب البايت.</p>
+  </details>
+  <div id="msg"></div>
+  <div id="rooms"></div>
+</div>
+<div id="bar">
+  <div class="t">أنت في الغرفة <b id="cur"></b> باسم Admin، ويراك الجميع في القائمة</div>
+  <div><button id="talk">اضغط للكلام</button> <button id="leave">خروج من الغرفة</button></div>
+</div>
+<script>
+(function(){
+var key='';try{key=sessionStorage.getItem('k')||''}catch(e){}
+var $=function(id){return document.getElementById(id)};
+var ws=null,joined=null,ctx=null,nextT=0,mic=null,proc=null,talking=false,want=false,timer=null;
+var cid='adm'+Math.random().toString(36).slice(2,12)+Date.now().toString(36);
+
+function api(path,method){
+  return fetch(path,{method:method||'GET',headers:{'x-admin-key':key},cache:'no-store'}).then(function(r){
+    if(r.status===401||r.status===429){var s=r.status;logout(s===429?'محاولات كثيرة، انتظر قليلاً':'كلمة السر خاطئة');throw new Error('auth')}
+    return r.json();
+  });
+}
+function showApp(on){$('login').style.display=on?'none':'flex';$('app').style.display=on?'block':'none'}
+function logout(msg){
+  key='';try{sessionStorage.removeItem('k')}catch(e){}
+  leave();clearTimeout(timer);showApp(false);$('err').textContent=msg||'';
+}
+function login(){
+  key=$('pw').value;$('err').textContent='';
+  api('/admin/api/rooms').then(function(d){
+    try{sessionStorage.setItem('k',key)}catch(e){}
+    showApp(true);render(d);poll();
+  }).catch(function(e){if(e&&e.message!=='auth')$('err').textContent='تعذر الاتصال بالسيرفر'});
+}
+function poll(){
+  clearTimeout(timer);
+  api('/admin/api/rooms').then(render).catch(function(){}).then(function(){
+    if(key)timer=setTimeout(poll,2000);
+  });
+}
+function render(d){
+  $('stat').textContent='المتصلون: '+d.total+' | الغرف: '+d.rooms.length;
+  var box=$('rooms');box.textContent='';
+  if(!d.rooms.length){var e=document.createElement('div');e.className='empty';e.textContent='لا توجد غرف الآن';box.appendChild(e);return}
+  d.rooms.forEach(function(r){
+    var c=document.createElement('div');c.className='room'+(r.room===joined?' me':'');
+    var h=document.createElement('h2');
+    var t=document.createElement('div');t.textContent='غرفة '+r.room;
+    var s=document.createElement('span');s.textContent=r.count+' / 16';t.appendChild(document.createTextNode(' '));t.appendChild(s);
+    var j=document.createElement('button');j.textContent=r.room===joined?'داخل الغرفة':'دخول';j.disabled=r.room===joined;
+    j.onclick=function(){join(r.room)};
+    h.appendChild(t);h.appendChild(j);c.appendChild(h);
+    r.members.forEach(function(m){
+      var p=document.createElement('div');p.className='p';
+      var d1=document.createElement('span');d1.className='dot'+(m.speaking?' talk':'');
+      var n=document.createElement('span');n.className='n';n.textContent=m.name;
+      var st=document.createElement('span');st.className='m';st.textContent=m.muted?'مايك مغلق':'';
+      var k=document.createElement('button');k.className='k';k.textContent='إخراج';
+      k.onclick=function(){if(confirm('إخراج '+m.name+' من الغرفة ومنعه 10 دقائق؟'))
+        api('/admin/api/kick?room='+encodeURIComponent(r.room)+'&id='+m.id,'POST').then(poll)};
+      p.appendChild(d1);p.appendChild(n);p.appendChild(st);p.appendChild(k);c.appendChild(p);
+    });
+    box.appendChild(c);
+  });
+}
+
+function join(room){
+  leave();
+  var AC=window.AudioContext||window.webkitAudioContext;
+  if(!ctx)ctx=new AC();
+  if(ctx.resume)ctx.resume();
+  var proto=location.protocol==='https:'?'wss://':'ws://';
+  var w=new WebSocket(proto+location.host+'/?room='+encodeURIComponent(room)+'&name=Admin&v=3&cid='+cid);
+  w.binaryType='arraybuffer';
+  var opened=false;
+  ws=w;
+  w.onopen=function(){opened=true;joined=room;nextT=0;$('cur').textContent=room;$('bar').style.display='flex';$('msg').textContent='';w.send('m1');poll()};
+  w.onmessage=function(e){
+    if(typeof e.data==='string')return;
+    var u=new Uint8Array(e.data);
+    if(u.length>2&&u[0]===1)play(u.subarray(2));
+  };
+  w.onclose=function(){
+    if(ws!==w)return;
+    ws=null;joined=null;stopMic();$('bar').style.display='none';
+    $('msg').textContent=opened?'انقطع الاتصال بالغرفة':'تعذر الدخول (الغرفة ممتلئة أو محظور مؤقتاً)';
+    poll();
+  };
+}
+function leave(){
+  want=false;talking=false;
+  var w=ws;ws=null;joined=null;
+  if(w){try{w.close()}catch(e){}}
+  stopMic();$('bar').style.display='none';$('talk').classList.remove('on');
+}
+function stopMic(){
+  if(proc){try{proc.disconnect()}catch(e){}proc.onaudioprocess=null;proc=null}
+  if(mic){mic.getTracks().forEach(function(t){t.stop()});mic=null}
+}
+
+function play(u8){
+  if(!ctx)return;
+  var n=u8.length>>1;if(n<1)return;
+  var rate=+$('rate').value,be=$('be').checked;
+  var buf=ctx.createBuffer(1,n,rate),ch=buf.getChannelData(0);
+  var dv=new DataView(u8.buffer,u8.byteOffset,n*2);
+  for(var i=0;i<n;i++)ch[i]=dv.getInt16(i*2,!be)/32768;
+  var s=ctx.createBufferSource();s.buffer=buf;s.connect(ctx.destination);
+  var t=ctx.currentTime;
+  if(nextT<t+0.02||nextT>t+0.6)nextT=t+0.08;
+  s.start(nextT);nextT+=n/rate;
+}
+
+function ensureMic(){
+  if(mic)return Promise.resolve();
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return Promise.reject(new Error('nomic'));
+  return navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}).then(function(s){
+    mic=s;
+    var src=ctx.createMediaStreamSource(s);
+    proc=ctx.createScriptProcessor(2048,1,1);
+    var ratio=ctx.sampleRate/8000,acc=0,cnt=0,pos=0,q=[];
+    proc.onaudioprocess=function(e){
+      if(!talking||!ws||ws.readyState!==1)return;
+      var d=e.inputBuffer.getChannelData(0);
+      for(var i=0;i<d.length;i++){
+        acc+=d[i];cnt++;pos+=1;
+        if(pos>=ratio){
+          pos-=ratio;
+          var v=Math.max(-1,Math.min(1,acc/cnt));acc=0;cnt=0;
+          q.push(Math.round(v*32767));
+        }
+      }
+      var be=$('be').checked;
+      while(q.length>=160){
+        var f=q.splice(0,160),b=new Uint8Array(320),dv=new DataView(b.buffer);
+        for(var j=0;j<160;j++)dv.setInt16(j*2,f[j],!be);
+        if(ws.bufferedAmount<65536)ws.send(b);
+      }
+    };
+    var z=ctx.createGain();z.gain.value=0;
+    src.connect(proc);proc.connect(z);z.connect(ctx.destination);
+  });
+}
+function down(){
+  if(!ws||want)return;
+  want=true;
+  ensureMic().then(function(){
+    if(!want||!ws)return;
+    talking=true;$('talk').classList.add('on');$('talk').textContent='تتكلم الآن';
+    ws.send('m0');
+  }).catch(function(){want=false;$('msg').textContent='تعذر فتح المايك. اسمح للموقع باستخدام المايك، ويحتاج اتصالاً آمناً https'});
+}
+function up(){
+  want=false;
+  if(talking){talking=false;try{if(ws)ws.send('m1')}catch(e){}}
+  $('talk').classList.remove('on');$('talk').textContent='اضغط للكلام';
+}
+
+var tb=$('talk');
+tb.addEventListener('pointerdown',function(e){e.preventDefault();try{tb.setPointerCapture(e.pointerId)}catch(x){}down()});
+tb.addEventListener('pointerup',up);
+tb.addEventListener('pointercancel',up);
+tb.addEventListener('contextmenu',function(e){e.preventDefault()});
+document.addEventListener('keydown',function(e){
+  if(e.code==='Space'&&!e.repeat&&ws&&document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='SELECT'){e.preventDefault();down()}
+});
+document.addEventListener('keyup',function(e){if(e.code==='Space')up()});
+$('go').onclick=login;
+$('pw').addEventListener('keydown',function(e){if(e.key==='Enter')login()});
+$('out').onclick=function(){logout('')};
+$('leave').onclick=function(){leave();poll()};
+window.addEventListener('beforeunload',function(){leave()});
+if(key){
+  api('/admin/api/rooms').then(function(d){showApp(true);render(d);poll()}).catch(function(){});
+}
+})();
+</script>
+</body>
+</html>`;
 
 const server = http.createServer((req, res) => {
+  const path = (req.url || '/').split('?')[0];
+  if (path === '/admin' || path === '/admin/') {
+    if (!adminHash) return reply(res, 404, 'text/plain', 'Not found');
+    return reply(res, 200, 'text/html; charset=utf-8', ADMIN_HTML, {
+      'X-Frame-Options': 'DENY',
+      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws: wss:",
+    });
+  }
+  if (path === '/admin/api/rooms' && req.method === 'GET') {
+    if (!adminAuthed(req, res)) return;
+    return reply(res, 200, 'application/json', JSON.stringify(roomsSnapshot()));
+  }
+  if (path === '/admin/api/kick' && req.method === 'POST') {
+    if (!adminAuthed(req, res)) return;
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch (e) { return reply(res, 400, 'application/json', '{"error":"bad"}'); }
+    const ok = kickClient(url.searchParams.get('room') || '', parseInt(url.searchParams.get('id'), 10));
+    return reply(res, 200, 'application/json', JSON.stringify({ ok }));
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('voice relay ok');
 });
@@ -108,6 +437,7 @@ function handleMessage(client, opcode, payload) {
     const now = Date.now();
     if (now - client.winStart >= 1000) { client.winStart = now; client.winFrames = 0; }
     if (++client.winFrames > MAX_FRAMES_PER_SEC) return;
+    client.lastAudio = now; // lets the admin panel show who is speaking
     // build each kind of frame ONCE and give the same bytes to every listener
     let frameV2 = null, frameRaw = null;
     for (const c of members.values()) {
@@ -198,13 +528,19 @@ server.on('upgrade', (req, socket) => {
     socket.end('HTTP/1.1 503 Server Full\r\n\r\n');
     return;
   }
+  const cid = (url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
+  const ip = clientIp(req);
+  const banKey = cid.length >= 8 ? 'c:' + cid : 'i:' + ip;
+  if ((bans.get(banKey) || 0) > Date.now()) {
+    socket.end('HTTP/1.1 403 Removed By Admin\r\n\r\n');
+    return;
+  }
   let members = rooms.get(room);
   if (members && members.size >= MAX_ROOM_USERS) {
     socket.end('HTTP/1.1 503 Room Full\r\n\r\n');
     return;
   }
   // the same phone connecting again (toggle, network change, app restart): drop its older connection first
-  const cid = (url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
   if (cid.length >= 8 && byCid.has(cid)) removeClient(byCid.get(cid));
   members = rooms.get(room);
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
@@ -220,13 +556,13 @@ server.on('upgrade', (req, socket) => {
   let id = 1;
   while (members.has(id)) id++;
   const client = {
-    socket, room, id,
+    socket, room, id, ip,
     name: cleanName(url.searchParams.get('name')),
     ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
     cid: cid.length >= 8 ? cid : '',
     micMuted: false,
     blocked: new Set(),
-    winStart: 0, winFrames: 0,
+    winStart: 0, winFrames: 0, lastAudio: 0,
     alive: true, removed: false,
   };
   members.set(id, client);
@@ -247,6 +583,8 @@ setInterval(() => {
       send(c, 9, Buffer.alloc(0));
     }
   }
+  const now = Date.now();
+  for (const [k, until] of bans) if (until <= now) bans.delete(k);
 }, 25000);
 
-server.listen(PORT, () => console.log('voice relay listening on ' + PORT));
+server.listen(PORT, () => console.log('voice relay listening on ' + PORT + (adminHash ? ' (admin panel on /admin)' : ' (admin panel off: set ADMIN_PASSWORD)')));

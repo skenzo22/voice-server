@@ -413,4 +413,264 @@ const server = http.createServer((req, res) => {
     return reply(res, 200, 'application/json', JSON.stringify(Object.assign(roomsSnapshot(), { wst: ADMIN_WS_TOKEN })));
   }
   if (path === '/admin/api/health' && req.method === 'GET') {
-    if (!adminAuthed(req, res)) return
+    if (!adminAuthed(req, res)) return;
+    return reply(res, 200, 'application/json', JSON.stringify(healthSnapshot()));
+  }
+  if (path === '/admin/api/kick' && req.method === 'POST') {
+    if (!adminAuthed(req, res)) return;
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch (e) { return reply(res, 400, 'application/json', '{"error":"bad"}'); }
+    const ok = kickClient(url.searchParams.get('room') || '', parseInt(url.searchParams.get('id'), 10));
+    return reply(res, 200, 'application/json', JSON.stringify({ ok }));
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('voice relay ok');
+});
+
+function cleanName(raw) {
+  let n = String(raw || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  n = Array.from(n).slice(0, 16).join('');
+  return n || 'Player';
+}
+
+function frame(opcode, payload) {
+  const len = payload.length;
+  let head;
+  if (len < 126) {
+    head = Buffer.from([0x80 | opcode, len]);
+  } else {
+    head = Buffer.from([0x80 | opcode, 126, len >> 8, len & 255]);
+  }
+  return Buffer.concat([head, payload]);
+}
+
+function writeFrame(client, buf, droppable) {
+  const s = client.socket;
+  if (s.destroyed || !s.writable) return;
+  if (droppable && s.writableLength > MAX_BACKLOG) { stats.dropped++; return; } // drop audio, never queue it forever
+  stats.framesOut++;
+  stats.bytesOut += buf.length;
+  s.write(buf);
+}
+
+function send(client, opcode, payload) {
+  const s = client.socket;
+  if (s.destroyed || !s.writable) return;
+  if (opcode === 2 && s.writableLength > MAX_BACKLOG) return; // drop audio, never queue it forever
+  s.write(frame(opcode, payload));
+}
+
+function broadcastRoster(room) {
+  const members = rooms.get(room);
+  if (!members) return;
+  // v2 list (id, name)
+  const parts2 = [Buffer.from([2, members.size])];
+  for (const [id, c] of members) {
+    const nb = Buffer.from(c.name, 'utf8');
+    parts2.push(Buffer.from([id, nb.length]), nb);
+  }
+  const msg2 = Buffer.concat(parts2);
+  for (const c of members.values()) {
+    if (c.ver === 2) {
+      send(c, 2, msg2);
+    } else if (c.ver >= 3) {
+      // v3 list: every person gets his own copy, with "this is you" marked
+      const parts3 = [Buffer.from([3, members.size])];
+      for (const [id, m] of members) {
+        const nb = Buffer.from(m.name, 'utf8');
+        const flags = (m.micMuted ? 1 : 0) | (m === c ? 2 : 0) | (m.admin ? 4 : 0); // 4 = verified admin
+        parts3.push(Buffer.from([id, flags, nb.length]), nb);
+      }
+      send(c, 2, Buffer.concat(parts3));
+    }
+  }
+}
+
+function removeClient(client) {
+  if (client.removed) return;
+  client.removed = true;
+  totalClients--;
+  if (client.cid && byCid.get(client.cid) === client) byCid.delete(client.cid);
+  const members = rooms.get(client.room);
+  if (members) {
+    members.delete(client.id);
+    for (const m of members.values()) m.blocked.delete(client.id);
+    if (members.size === 0) rooms.delete(client.room);
+    else broadcastRoster(client.room);
+  }
+  client.socket.destroy();
+}
+
+function handleMessage(client, opcode, payload) {
+  client.alive = true;
+  if (opcode === 2) { // audio
+    if (payload.length === 0 || payload.length > MAX_PAYLOAD) return;
+    const members = rooms.get(client.room);
+    if (!members) return;
+    // a speaker cannot send more than a normal number of frames per second
+    const now = Date.now();
+    if (now - client.winStart >= 1000) { client.winStart = now; client.winFrames = 0; }
+    if (++client.winFrames > MAX_FRAMES_PER_SEC) { stats.rateLimited++; return; }
+    stats.framesIn++;
+    client.lastAudio = now; // lets the admin panel show who is speaking
+    // build each kind of frame ONCE and give the same bytes to every listener
+    let frameV2 = null, frameRaw = null;
+    for (const c of members.values()) {
+      if (c === client) continue;
+      if (client.blocked.size && client.blocked.has(c.id)) continue; // he asked not to be heard by this person
+      if (c.ver >= 2) {
+        if (!frameV2) frameV2 = frame(2, Buffer.concat([Buffer.from([1, client.id]), payload]));
+        writeFrame(c, frameV2, true);
+      } else {
+        if (!frameRaw) frameRaw = frame(2, payload);
+        writeFrame(c, frameRaw, true);
+      }
+    }
+  } else if (opcode === 1) { // text: "m1" = my mic is closed, "m0" = my mic is open
+    const t = payload.toString('utf8');
+    if ((t[0] === 'b' || t[0] === 'u') && /^\d{1,3}$/.test(t.slice(1))) {
+      const rid = parseInt(t.slice(1), 10);
+      if (t[0] === 'b') {
+        if (client.blocked.size < 64) client.blocked.add(rid);
+      } else {
+        client.blocked.delete(rid);
+      }
+    } else if (t === 'm1' || t === 'm0') {
+      const closed = t === 'm1';
+      if (client.micMuted !== closed) {
+        client.micMuted = closed;
+        broadcastRoster(client.room);
+      }
+    }
+  } else if (opcode === 9) { // ping
+    send(client, 10, payload);
+  } else if (opcode === 8) { // close
+    send(client, 8, Buffer.alloc(0));
+    removeClient(client);
+  }
+  // text frames and pongs only count as "alive"
+}
+
+function attachParser(client) {
+  let buf = Buffer.alloc(0);
+  client.socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    while (buf.length >= 2) {
+      const b0 = buf[0], b1 = buf[1];
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        removeClient(client); // far too big for this service
+        return;
+      }
+      if (len > MAX_PAYLOAD) { removeClient(client); return; }
+      const need = off + (masked ? 4 : 0) + len;
+      if (buf.length < need) return;
+      let payload = buf.slice(off + (masked ? 4 : 0), need);
+      if (masked) {
+        const mask = buf.slice(off, off + 4);
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      }
+      buf = buf.slice(need);
+      handleMessage(client, opcode, payload);
+      if (client.removed) return;
+    }
+  });
+}
+
+server.on('upgrade', (req, socket) => {
+  const key = req.headers['sec-websocket-key'];
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch (e) {
+    socket.destroy();
+    return;
+  }
+  const room = (url.searchParams.get('room') || '').slice(0, 64);
+  if (!key || !room) {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    return;
+  }
+  // the verified admin: the connection carries the key derived from the admin password
+  const ak = url.searchParams.get('ak') || '';
+  const isAdmin = !!ADMIN_WS_TOKEN && ak.length === ADMIN_WS_TOKEN.length &&
+    crypto.timingSafeEqual(Buffer.from(ak), Buffer.from(ADMIN_WS_TOKEN));
+  let displayName = isAdmin ? 'Admin' : cleanName(url.searchParams.get('name'));
+  if (!isAdmin && isReserved(displayName)) displayName = 'Player';
+  if (totalClients >= MAX_CLIENTS && !isAdmin) {
+    stats.rejected++;
+    socket.end('HTTP/1.1 503 Server Full\r\n\r\n');
+    return;
+  }
+  const cid =(url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
+  const ip = clientIp(req);
+  const banKey = cid.length >= 8 ? 'c:' + cid : 'i:' + ip;
+  if (!isAdmin && (bans.get(banKey) || 0) > Date.now()) {
+    stats.rejected++;
+    socket.end('HTTP/1.1 403 Removed By Admin\r\n\r\n');
+    return;
+  }
+  let members = rooms.get(room);
+  if (members && members.size >= MAX_ROOM_USERS && !isAdmin) {
+    stats.rejected++;
+    socket.end('HTTP/1.1 503 Room Full\r\n\r\n');
+    return;
+  }
+  // the same phone connecting again (toggle, network change, app restart): drop its older connection first
+  if (cid.length >= 8 && byCid.has(cid)) removeClient(byCid.get(cid));
+  members = rooms.get(room);
+  const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+    'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  socket.setNoDelay(true);
+
+  if (!members) {
+    members = new Map();
+    rooms.set(room, members);
+  }
+  let id = 1;
+  while (members.has(id)) id++;
+  const client = {
+    socket, room, id, ip, admin: isAdmin,
+    name: displayName,
+    ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
+    cid: cid.length >= 8 ? cid : '',
+    micMuted: false,
+    blocked: new Set(),
+    winStart: 0, winFrames: 0, lastAudio: 0,
+    alive: true, removed: false,
+  };
+  members.set(id, client);
+  totalClients++;
+  stats.joins++;
+  if (totalClients > stats.peak) stats.peak = totalClients;
+  if (client.cid) byCid.set(client.cid, client);
+  socket.on('close', () => removeClient(client));
+  socket.on('error', () => removeClient(client));
+  attachParser(client);
+  broadcastRoster(room);
+});
+
+// Drop connections that went silent (phone lost signal, app killed...).
+setInterval(() => {
+  for (const members of rooms.values()) {
+    for (const c of Array.from(members.values())) {
+      if (!c.alive) { removeClient(c); continue; }
+      c.alive = false;
+      send(c, 9, Buffer.alloc(0));
+    }
+  }
+  const now = Date.now();
+  for (const [k, until] of bans) if (until <= now) bans.delete(k);
+}, 25000);
+
+server.listen(PORT, () => console.log('voice relay listening on ' + PORT + (adminHash ? ' (admin panel on /admin)' : ' (admin panel off: set ADMIN_PASSWORD)')));

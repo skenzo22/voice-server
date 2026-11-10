@@ -145,14 +145,6 @@ select{font:inherit;background:#101010;color:var(--text);border:1px solid var(--
     <h1>الغرف المفتوحة</h1>
     <div><span class="stat" id="stat"></span> <button id="out">خروج</button></div>
   </header>
-  <details>
-    <summary>إعدادات الصوت</summary>
-    <p>
-      <label>معدل العينات <select id="rate"><option value="8000">8000</option><option value="16000">16000</option></select></label>
-      <label><input type="checkbox" id="be"> عكس ترتيب البايت</label>
-    </p>
-    <p>إن سمعت ضجيجاً بدل الصوت جرّب عكس ترتيب البايت.</p>
-  </details>
   <div id="msg"></div>
   <div id="rooms"></div>
 </div>
@@ -251,13 +243,18 @@ function stopMic(){
   if(mic){mic.getTracks().forEach(function(t){t.stop()});mic=null}
 }
 
+// The app sends 16 kHz mono, G.711 mu-law, 8 bit, 320 samples (20 ms) per frame.
+var RATE=16000,FRAME=320;
+function mu2lin(b){var u=~b&255,sg=u&128,ex=(u>>4)&7,mt=u&15,s=((mt<<3)+132)<<ex;s-=132;return sg?-s:s}
+function lin2mu(x){var s=x,sg=(s>>8)&128;if(sg)s=-s;if(s>32635)s=32635;s+=132;var ex=7;for(var m=16384;(s&m)===0&&ex>0;m>>=1)ex--;var mt=(s>>(ex+3))&15;return (~(sg|(ex<<4)|mt))&255}
+var MU=new Float32Array(256);for(var k=0;k<256;k++)MU[k]=mu2lin(k)/32768;
+
 function play(u8){
   if(!ctx)return;
-  var n=u8.length>>1;if(n<1)return;
-  var rate=+$('rate').value,be=$('be').checked;
+  var n=u8.length;if(n<1)return;
+  var rate=RATE;
   var buf=ctx.createBuffer(1,n,rate),ch=buf.getChannelData(0);
-  var dv=new DataView(u8.buffer,u8.byteOffset,n*2);
-  for(var i=0;i<n;i++)ch[i]=dv.getInt16(i*2,!be)/32768;
+  for(var i=0;i<n;i++)ch[i]=MU[u8[i]];
   var s=ctx.createBufferSource();s.buffer=buf;s.connect(ctx.destination);
   var t=ctx.currentTime;
   if(nextT<t+0.02||nextT>t+0.6)nextT=t+0.08;
@@ -271,7 +268,7 @@ function ensureMic(){
     mic=s;
     var src=ctx.createMediaStreamSource(s);
     proc=ctx.createScriptProcessor(2048,1,1);
-    var ratio=ctx.sampleRate/8000,acc=0,cnt=0,pos=0,q=[];
+    var ratio=ctx.sampleRate/RATE,acc=0,cnt=0,pos=0,q=[];
     proc.onaudioprocess=function(e){
       if(!talking||!ws||ws.readyState!==1)return;
       var d=e.inputBuffer.getChannelData(0);
@@ -283,10 +280,9 @@ function ensureMic(){
           q.push(Math.round(v*32767));
         }
       }
-      var be=$('be').checked;
-      while(q.length>=160){
-        var f=q.splice(0,160),b=new Uint8Array(320),dv=new DataView(b.buffer);
-        for(var j=0;j<160;j++)dv.setInt16(j*2,f[j],!be);
+      while(q.length>=FRAME){
+        var f=q.splice(0,FRAME),b=new Uint8Array(FRAME);
+        for(var j=0;j<FRAME;j++)b[j]=lin2mu(f[j]);
         if(ws.bufferedAmount<65536)ws.send(b);
       }
     };

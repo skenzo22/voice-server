@@ -34,7 +34,12 @@ const ADMIN_WS_TOKEN = ADMIN_PASSWORD
   ? crypto.createHmac('sha256', ADMIN_PASSWORD).update('voice-admin-ws').digest('hex') : '';
 
 // Nobody else may use a name that looks like the admin's (the server renames them to "Player").
+const adminNames = new Set(); // names the verified admin has used since the server started
+function normName(s) {
+  return String(s).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
 function isReserved(n) {
+  if (adminNames.has(normName(n))) return true; // looks the same as the admin's current name
   const a = String(n).normalize('NFKC').toLowerCase();
   const latin = a.replace(/[^a-z]/g, '');
   const ar = a.replace(/[أإآٱ]/g, 'ا').replace(/[ً-ٟـ]/g, '').replace(/[^ء-ي]/g, '');
@@ -603,8 +608,14 @@ server.on('upgrade', (req, socket) => {
   const ak = url.searchParams.get('ak') || '';
   const isAdmin = !!ADMIN_WS_TOKEN && ak.length === ADMIN_WS_TOKEN.length &&
     crypto.timingSafeEqual(Buffer.from(ak), Buffer.from(ADMIN_WS_TOKEN));
-  let displayName = isAdmin ? 'Admin' : cleanName(url.searchParams.get('name'));
-  if (!isAdmin && isReserved(displayName)) displayName = 'Player';
+  // the admin chooses his own display name in the app (empty = "Admin"); nobody else may look like it
+  const rawName = url.searchParams.get('name');
+  let displayName = isAdmin && !String(rawName || '').trim() ? 'Admin' : cleanName(rawName);
+  if (isAdmin) {
+    if (adminNames.size < 30) adminNames.add(normName(displayName));
+  } else if (isReserved(displayName)) {
+    displayName = 'Player';
+  }
   if (totalClients >= MAX_CLIENTS && !isAdmin) {
     stats.rejected++;
     socket.end('HTTP/1.1 503 Server Full\r\n\r\n');

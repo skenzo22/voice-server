@@ -22,7 +22,7 @@ const BAN_MS = 10 * 60 * 1000;  // a person removed by the admin cannot come bac
 let totalClients = 0;
 const byCid = new Map();       // client id -> connection (one live connection per phone)
 const rooms = new Map();        // room -> Map(id -> client)
-const bans = new Map();         // "c:<cid>" or "i:<ip>" -> time when the ban ends
+const bans = new Map();         // "c:<cid>" or "i:<ip>" -> { until, name }
 
 // ---------------------------------------------------------------- admin panel
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -118,7 +118,7 @@ function roomsSnapshot() {
     });
   }
   list.sort((a, b) => b.count - a.count || (a.room < b.room ? -1 : 1));
-  return { total: totalClients, rooms: list };
+  return { total: totalClients, rooms: list, reports: openReports() };
 }
 
 function healthSnapshot() {
@@ -141,13 +141,211 @@ function healthSnapshot() {
   };
 }
 
+// ---------------------------------------------------------------- reports, bans, saving them
+// Players report a speaker with the text frame "r<id>". The admin sees who reported whom, and how many times,
+// so he can tell real reports from one person spamming. Bans are by phone id (cid), found by the player's name.
+const MAX_BAN_MS = 30 * 24 * 3600 * 1000;
+const REPORT_KEEP_MS = 7 * 24 * 3600 * 1000;
+const seen = new Map();    // normalized name -> { name, key, last, admin }: everybody who connected lately
+const reports = new Map(); // identity key -> { key, name, total, last, reporters: Map(identity key -> { name, n, last }) }
+
+function idKey(c) { return c.cid ? 'c:' + c.cid : 'i:' + c.ip; }
+
+function rememberName(name, key, admin) {
+  const k = normName(name);
+  if (!k) return;
+  seen.delete(k); // re-insert so the newest are last
+  seen.set(k, { name, key, last: Date.now(), admin: !!admin });
+  if (seen.size > 1500) seen.delete(seen.keys().next().value);
+  scheduleSave(20000);
+}
+
+function banStatus(key) {
+  const b = bans.get(key);
+  return b && b.until > Date.now() ? b : null;
+}
+
+function banFrame(secs) { // [4][seconds, 4 bytes]: tells a newer app that it is banned and for how long
+  const b = Buffer.alloc(5);
+  b[0] = 4;
+  b.writeUInt32BE(Math.max(1, Math.min(secs, 0xffffffff)), 1);
+  return b;
+}
+
+function banAndDrop(key, name, ms) {
+  const until = Date.now() + ms;
+  bans.set(key, { until, name });
+  scheduleSave(1000);
+  for (const members of rooms.values()) {
+    for (const c of Array.from(members.values())) {
+      if (c.admin || idKey(c) !== key) continue;
+      if (c.ver >= 4) send(c, 2, banFrame(Math.ceil(ms / 1000)));
+      send(c, 8, Buffer.alloc(0));
+      removeClient(c, true);
+    }
+  }
+  return until;
+}
+
+function banByName(name, hours) {
+  const e = seen.get(normName(name));
+  if (!e) return { ok: false, error: 'not_found' };
+  if (e.admin) return { ok: false, error: 'admin' };
+  const ms = Math.min(MAX_BAN_MS, Math.round(Number(hours) * 3600 * 1000));
+  if (!(ms >= 60000)) return { ok: false, error: 'bad_hours' };
+  const until = banAndDrop(e.key, e.name, ms);
+  return { ok: true, name: e.name, until };
+}
+
+function unban(name) {
+  const k = normName(name);
+  let n = 0;
+  for (const [key, b] of Array.from(bans)) {
+    if (normName(b.name) === k) { bans.delete(key); n++; }
+  }
+  const e = seen.get(k);
+  if (e && bans.delete(e.key)) n++;
+  if (n) scheduleSave(1000);
+  return n;
+}
+
+function pruneReports() {
+  const now = Date.now();
+  for (const [k, r] of reports) if (now - r.last > REPORT_KEEP_MS) reports.delete(k);
+  while (reports.size >= 300) {
+    let oldest = null;
+    for (const r of reports.values()) if (!oldest || r.last < oldest.last) oldest = r;
+    reports.delete(oldest.key);
+  }
+}
+
+function addReport(reporter, target) {
+  const now = Date.now();
+  if (now - reporter.rWin > 3600000) { reporter.rWin = now; reporter.rN = 0; }
+  if (++reporter.rN > 40) return; // a flood from one phone is ignored after 40 an hour
+  const key = idKey(target);
+  let r = reports.get(key);
+  if (!r) {
+    if (reports.size >= 300) pruneReports();
+    r = { key, name: target.name, total: 0, last: 0, reporters: new Map() };
+    reports.set(key, r);
+  }
+  const rk = idKey(reporter);
+  let p = r.reporters.get(rk);
+  if (!p) {
+    if (r.reporters.size >= 60) return;
+    p = { name: reporter.name, n: 0, last: 0 };
+    r.reporters.set(rk, p);
+  }
+  r.name = target.name;
+  r.total++;
+  r.last = now;
+  p.name = reporter.name;
+  p.n++;
+  p.last = now;
+  scheduleSave(20000);
+}
+
+function reportsSnapshot() {
+  const now = Date.now();
+  const out = [];
+  for (const r of Array.from(reports.values())) {
+    if (now - r.last > REPORT_KEEP_MS) { reports.delete(r.key); continue; }
+    out.push({
+      key: r.key, name: r.name, total: r.total, unique: r.reporters.size, last: r.last,
+      banned: !!banStatus(r.key),
+      reporters: Array.from(r.reporters.values()).sort((a, b) => b.n - a.n).slice(0, 12)
+        .map((p) => ({ name: p.name, n: p.n, last: p.last })),
+    });
+  }
+  out.sort((a, b) => b.total - a.total || b.last - a.last);
+  return out.slice(0, 50);
+}
+
+function bansSnapshot() {
+  const now = Date.now();
+  return Array.from(bans.entries()).filter(([, b]) => b.until > now)
+    .sort((a, b) => b[1].until - a[1].until)
+    .map(([key, b]) => ({ key, name: b.name, left: Math.round((b.until - now) / 1000) }));
+}
+
+function openReports() {
+  let n = 0;
+  for (const r of reports.values()) if (!banStatus(r.key)) n++;
+  return n;
+}
+
+// Optional saving to a free Upstash Redis database, so bans and reports survive Render restarts.
+// Without the two environment variables everything lives in memory only.
+const STORE_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+const STORE_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+let saveTimer = null, saveAt = 0;
+
+function stateSnapshot() {
+  const now = Date.now();
+  return {
+    bans: Array.from(bans.entries()).filter(([, b]) => b.until > now),
+    seen: Array.from(seen.entries()),
+    adminNames: Array.from(adminNames),
+    reports: Array.from(reports.values()).map((r) => ({
+      key: r.key, name: r.name, total: r.total, last: r.last, reporters: Array.from(r.reporters.entries()),
+    })),
+  };
+}
+
+function restoreState(o) {
+  const now = Date.now();
+  for (const [k, b] of (o.bans || [])) if (b && b.until > now && !bans.has(k)) bans.set(k, { until: b.until, name: String(b.name || '') });
+  for (const [k, e] of (o.seen || [])) if (e && !seen.has(k)) seen.set(k, e);
+  for (const n of (o.adminNames || [])) adminNames.add(n);
+  for (const r of (o.reports || [])) {
+    if (!r || reports.has(r.key) || now - r.last > REPORT_KEEP_MS) continue;
+    reports.set(r.key, { key: r.key, name: r.name, total: r.total, last: r.last, reporters: new Map(r.reporters || []) });
+  }
+}
+
+function storeCall(cmd) {
+  return fetch(STORE_URL, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + STORE_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(cmd),
+    signal: AbortSignal.timeout(8000),
+  }).then((r) => r.json());
+}
+
+function scheduleSave(delay) {
+  if (!STORE_URL) return;
+  const at = Date.now() + delay;
+  if (saveTimer && saveAt <= at) return;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveAt = at;
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    try {
+      await storeCall(['SET', 'voice_state', JSON.stringify(stateSnapshot())]);
+    } catch (e) {
+      console.log('could not save state: ' + e.message);
+      scheduleSave(30000);
+    }
+  }, delay);
+}
+
+async function loadState() {
+  if (!STORE_URL) return;
+  try {
+    const j = await storeCall(['GET', 'voice_state']);
+    if (j && j.result) restoreState(JSON.parse(j.result));
+    console.log('state loaded: ' + bans.size + ' bans, ' + reports.size + ' reported players');
+  } catch (e) {
+    console.log('could not load state: ' + e.message);
+  }
+}
+
 function kickClient(room, id) {
   const members = rooms.get(room);
   const c = members && members.get(id);
   if (!c || c.admin) return false;
-  bans.set(c.cid ? 'c:' + c.cid : 'i:' + c.ip, Date.now() + BAN_MS);
-  send(c, 8, Buffer.alloc(0));
-  removeClient(c);
+  banAndDrop(idKey(c), c.name, BAN_MS);
   return true;
 }
 
@@ -417,6 +615,28 @@ const server = http.createServer((req, res) => {
     if (!adminAuthed(req, res)) return;
     return reply(res, 200, 'application/json', JSON.stringify(Object.assign(roomsSnapshot(), { wst: ADMIN_WS_TOKEN })));
   }
+  if (path === '/admin/api/reports' && req.method === 'GET') {
+    if (!adminAuthed(req, res)) return;
+    return reply(res, 200, 'application/json', JSON.stringify({
+      reports: reportsSnapshot(), bans: bansSnapshot(), persistent: !!STORE_URL,
+    }));
+  }
+  if (req.method === 'POST' && (path === '/admin/api/ban' || path === '/admin/api/unban' || path === '/admin/api/reports/clear')) {
+    if (!adminAuthed(req, res)) return;
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch (e) { return reply(res, 400, 'application/json', '{"error":"bad"}'); }
+    let out;
+    if (path === '/admin/api/ban') {
+      out = banByName(String(url.searchParams.get('name') || '').slice(0, 40), parseFloat(url.searchParams.get('hours')));
+    } else if (path === '/admin/api/unban') {
+      const n = unban(String(url.searchParams.get('name') || '').slice(0, 40));
+      out = { ok: n > 0, removed: n };
+    } else {
+      out = { ok: reports.delete(String(url.searchParams.get('key') || '')) };
+      scheduleSave(1000);
+    }
+    return reply(res, 200, 'application/json', JSON.stringify(out));
+  }
   if (path === '/admin/api/health' && req.method === 'GET') {
     if (!adminAuthed(req, res)) return;
     return reply(res, 200, 'application/json', JSON.stringify(healthSnapshot()));
@@ -491,7 +711,7 @@ function broadcastRoster(room) {
   }
 }
 
-function removeClient(client) {
+function removeClient(client, graceful) {
   if (client.removed) return;
   client.removed = true;
   totalClients--;
@@ -503,7 +723,12 @@ function removeClient(client) {
     if (members.size === 0) rooms.delete(client.room);
     else broadcastRoster(client.room);
   }
-  client.socket.destroy();
+  if (graceful) { // let the last frames reach the phone before closing
+    client.socket.end();
+    setTimeout(() => client.socket.destroy(), 1500);
+  } else {
+    client.socket.destroy();
+  }
 }
 
 function handleMessage(client, opcode, payload) {
@@ -540,6 +765,10 @@ function handleMessage(client, opcode, payload) {
       } else {
         client.blocked.delete(rid);
       }
+    } else if (t[0] === 'r' && /^\d{1,3}$/.test(t.slice(1))) { // "r<id>" = report that person
+      const members = rooms.get(client.room);
+      const target = members && members.get(parseInt(t.slice(1), 10));
+      if (target && target !== client && !target.admin) addReport(client, target);
     } else if (t === 'm1' || t === 'm0') {
       const closed = t === 'm1';
       if (client.micMuted !== closed) {
@@ -590,6 +819,13 @@ function attachParser(client) {
   });
 }
 
+function handshake(socket, key) {
+  const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+    'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+}
+
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
   let url;
@@ -621,12 +857,23 @@ server.on('upgrade', (req, socket) => {
     socket.end('HTTP/1.1 503 Server Full\r\n\r\n');
     return;
   }
-  const cid =(url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
+  const ver = parseInt(url.searchParams.get('v') || '1', 10) || 1;
+  const cid = (url.searchParams.get('cid') || '').replace(/[^0-9a-zA-Z]/g, '').slice(0, 40);
   const ip = clientIp(req);
   const banKey = cid.length >= 8 ? 'c:' + cid : 'i:' + ip;
-  if (!isAdmin && (bans.get(banKey) || 0) > Date.now()) {
+  const banned = banStatus(banKey);
+  if (!isAdmin && banned) {
     stats.rejected++;
-    socket.end('HTTP/1.1 403 Removed By Admin\r\n\r\n');
+    if (ver >= 4) { // a newer app is told that it is banned and for how long
+      handshake(socket, key);
+      socket.on('error', () => {});
+      socket.end(Buffer.concat([
+        frame(2, banFrame(Math.ceil((banned.until - Date.now()) / 1000))),
+        frame(8, Buffer.alloc(0)),
+      ]));
+    } else {
+      socket.end('HTTP/1.1 403 Removed By Admin\r\n\r\n');
+    }
     return;
   }
   let members = rooms.get(room);
@@ -638,10 +885,7 @@ server.on('upgrade', (req, socket) => {
   // the same phone connecting again (toggle, network change, app restart): drop its older connection first
   if (cid.length >= 8 && byCid.has(cid)) removeClient(byCid.get(cid));
   members = rooms.get(room);
-  const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
-  socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
-    'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-    'Sec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+  handshake(socket, key);
   socket.setNoDelay(true);
 
   if (!members) {
@@ -653,11 +897,11 @@ server.on('upgrade', (req, socket) => {
   const client = {
     socket, room, id, ip, admin: isAdmin,
     name: displayName,
-    ver: parseInt(url.searchParams.get('v') || '1', 10) || 1,
+    ver,
     cid: cid.length >= 8 ? cid : '',
     micMuted: false,
     blocked: new Set(),
-    winStart: 0, winFrames: 0, lastAudio: 0,
+    winStart: 0, winFrames: 0, lastAudio: 0, rWin: 0, rN: 0,
     alive: true, removed: false,
   };
   members.set(id, client);
@@ -665,6 +909,7 @@ server.on('upgrade', (req, socket) => {
   stats.joins++;
   if (totalClients > stats.peak) stats.peak = totalClients;
   if (client.cid) byCid.set(client.cid, client);
+  rememberName(displayName, idKey(client), isAdmin);
   socket.on('close', () => removeClient(client));
   socket.on('error', () => removeClient(client));
   attachParser(client);
@@ -681,7 +926,7 @@ setInterval(() => {
     }
   }
   const now = Date.now();
-  for (const [k, until] of bans) if (until <= now) bans.delete(k);
+  for (const [k, b] of bans) if (b.until <= now) bans.delete(k);
 }, 25000);
 
-server.listen(PORT, () => console.log('voice relay listening on ' + PORT + (adminHash ? ' (admin panel on /admin)' : ' (admin panel off: set ADMIN_PASSWORD)')));
+loadState().then(() => server.listen(PORT, () => console.log('voice relay listening on ' + PORT + (adminHash ? ' (admin panel on /admin)' : ' (admin panel off: set ADMIN_PASSWORD)') + (STORE_URL ? ' (saving bans and reports)' : ' (bans and reports are kept in memory only)'))));

@@ -68,7 +68,38 @@ setInterval(() => {
   rates.lagMs = lagMax;
   lagMax = 0;
   prev = { t: n, fi: stats.framesIn, fo: stats.framesOut, bo: stats.bytesOut, dr: stats.dropped, cpu: process.cpuUsage() };
+  noteIncident();
 }, 5000);
+// What counts as a problem. sev: 0 fine, 1 watch it (amber), 2 danger (red).
+function assess() {
+  const mem = process.memoryUsage();
+  const memMb = Math.round(mem.rss / 1048576);
+  const sev = {
+    lag: rates.lagMs > 250 ? 2 : rates.lagMs > 80 ? 1 : 0,
+    clients: totalClients >= MAX_CLIENTS ? 2 : totalClients > MAX_CLIENTS * 0.7 ? 1 : 0,
+    mem: memMb > 470 ? 2 : memMb > 400 ? 1 : 0,
+    cpu: rates.cpuPct > 85 ? 2 : rates.cpuPct > 60 ? 1 : 0,
+    drop: rates.dropped > 10 ? 2 : rates.dropped > 1 ? 1 : 0,
+  };
+  const worst = Math.max(sev.lag, sev.clients, sev.mem, sev.cpu, sev.drop);
+  return { sev, level: worst === 2 ? 'overload' : worst === 1 ? 'busy' : 'ok', memMb };
+}
+// A short list of the last problems with the numbers at that moment, so nothing is missed while nobody is watching.
+const incidents = [];
+let lastIncidentLevel = 'ok';
+function noteIncident() {
+  const a = assess();
+  const rank = { ok: 0, busy: 1, overload: 2 };
+  if (a.level !== 'ok' && rank[a.level] > rank[lastIncidentLevel]) {
+    incidents.unshift({
+      t: Date.now(), level: a.level, sev: a.sev,
+      clients: totalClients, memMb: a.memMb, cpuPct: rates.cpuPct, lagMs: rates.lagMs,
+      dropPerSec: rates.dropped, kbpsOut: rates.kbpsOut, framesOut: rates.framesOut,
+    });
+    if (incidents.length > 15) incidents.pop();
+  }
+  lastIncidentLevel = a.level;
+}
 const failedLogins = new Map(); // ip -> { n, first }
 const MAX_FAILS = 10;
 const FAIL_WINDOW = 10 * 60 * 1000;
@@ -126,11 +157,9 @@ function healthSnapshot() {
   let speaking = 0;
   for (const members of rooms.values()) for (const c of members.values()) if (now - c.lastAudio < 500) speaking++;
   const mem = process.memoryUsage();
-  let level = 'ok';
-  if (rates.lagMs > 80 || totalClients > MAX_CLIENTS * 0.7 || mem.rss > 400 * 1048576 || rates.dropped > 1) level = 'busy';
-  if (rates.lagMs > 250 || totalClients >= MAX_CLIENTS || rates.dropped > 10) level = 'overload';
+  const a = assess();
   return {
-    level,
+    level: a.level, sev: a.sev, incidents,
     uptime: Math.round((now - stats.start) / 1000),
     clients: totalClients, peak: stats.peak, maxClients: MAX_CLIENTS,
     rooms: rooms.size, speaking,
